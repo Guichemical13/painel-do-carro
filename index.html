@@ -249,6 +249,20 @@
   </div>
 </div>
 
+<div class="wrap" id="onboardingBanner" style="display:none; padding-top:18px;">
+  <div class="blueprint" style="position:relative; margin:6px; padding:16px 18px; border:1px solid var(--divider-strong); display:flex; flex-wrap:wrap; align-items:center; gap:14px; justify-content:space-between;">
+    <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+    <div style="flex:1; min-width:220px;">
+      <div class="eyebrow" style="margin-bottom:4px;">primeiro acesso</div>
+      <div style="font-size:14px; color:var(--muted); max-width:520px;">Este painel funciona sozinho, salvando num arquivo no seu computador. Se quiser acessar de qualquer aparelho, monte sua própria nuvem grátis (Google Sheets) em alguns minutos — os dados de cada pessoa ficam separados, cada um usa a própria planilha.</div>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn btn-outline-accent btn-small" id="btnOpenGuide">Ver passo a passo</button>
+      <button class="btn btn-primary btn-small" id="btnOpenCloudFromBanner">Configurar nuvem</button>
+    </div>
+  </div>
+</div>
+
 <!-- PANEL -->
 <div class="section on wrap" data-section="panel">
   <div class="panel-grid">
@@ -449,6 +463,26 @@
   </div>
 </div>
 
+<!-- Modal: setup guide -->
+<div class="overlay" id="overlayGuide">
+  <div class="modal wide">
+    <h3>Como ter sua própria nuvem</h3>
+    <div class="sub">Cada pessoa usa a própria planilha do Google — grátis, e os dados de cada um ficam separados e privados. Leva uns 5-10 minutos.</div>
+    <div style="display:flex; flex-direction:column; gap:12px; font-size:14px; line-height:1.55; max-height:50vh; overflow-y:auto; padding-right:4px;">
+      <div><b>1.</b> Crie uma planilha nova em sheets.google.com (pode ficar vazia).</div>
+      <div><b>2.</b> Menu <b>Extensões &gt; Apps Script</b>. Apague o conteúdo padrão e cole o código do botão abaixo.</div>
+      <div><b>3.</b> No seletor de função (perto do botão Executar), escolha <b>setupSheets</b> e clique em Executar. Aceite a autorização — são só as suas próprias abas sendo criadas.</div>
+      <div><b>4.</b> Ícone de engrenagem &gt; <b>Propriedades do script</b> &gt; adicione uma propriedade <span class="mono">APP_TOKEN</span> com um valor longo e aleatório, só seu — é a sua senha de acesso.</div>
+      <div><b>5.</b> Menu <b>Implantar &gt; Nova implantação &gt; App da Web</b>. Executar como "Eu", quem acessa "Qualquer pessoa". Copie a URL terminada em <span class="mono">/exec</span>.</div>
+      <div><b>6.</b> Volte aqui, clique em "Configurar nuvem" (canto superior) e cole essa URL e o token que você escolheu.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="btnCloseGuide">Fechar</button>
+      <button class="btn btn-primary" id="btnDownloadScript">Baixar código do Apps Script</button>
+    </div>
+  </div>
+</div>
+
 <!-- Modal: cloud sync config -->
 <div class="overlay" id="overlayCloud">
   <div class="modal">
@@ -487,6 +521,271 @@ const DEFAULT_DOCS = [
 const WARN_AT = 0.8;
 const KEY = 'painel_carro_draft';
 const CLOUD_KEY = 'painel_carro_cloud';
+const APPS_SCRIPT_SOURCE = `/**
+ * PAINEL DO CARRO — backend em Google Apps Script
+ * -------------------------------------------------
+ * Cole este arquivo inteiro no editor de Apps Script (Extensões > Apps Script)
+ * de uma planilha do Google Sheets.
+ *
+ * Passo a passo de configuração está no final deste arquivo, em comentário.
+ */
+
+const TOKEN = PropertiesService.getScriptProperties().getProperty('APP_TOKEN');
+const SS = SpreadsheetApp.getActiveSpreadsheet();
+
+const SHEETS = {
+  car: 'Carro',
+  categories: 'Categorias',
+  records: 'Registros',
+  items: 'Itens',
+  docs: 'Docs',
+  kmLog: 'KmLog'
+};
+
+/* ============================================================
+ *  ENTRADAS HTTP
+ * ============================================================ */
+
+// GET .../exec?token=SEU_TOKEN  → devolve o estado completo em JSON
+function doGet(e) {
+  try {
+    checkToken(e.parameter.token);
+    return jsonOut({ ok: true, data: getData() });
+  } catch (err) {
+    return jsonOut({ ok: false, error: String(err.message || err) });
+  }
+}
+
+// POST .../exec  com body JSON: { token: "...", data: {...estado completo...} }
+// Importante: no fetch do front-end, mande Content-Type: text/plain
+// (evita o preflight OPTIONS, que o Apps Script não trata bem).
+function doPost(e) {
+  try {
+    const body = JSON.parse(e.postData.contents);
+    checkToken(body.token);
+    saveData(body.data);
+    return jsonOut({ ok: true });
+  } catch (err) {
+    return jsonOut({ ok: false, error: String(err.message || err) });
+  }
+}
+
+function checkToken(token) {
+  if (!TOKEN) throw new Error('Defina a propriedade de script APP_TOKEN antes de usar.');
+  if (token !== TOKEN) throw new Error('Token inválido.');
+}
+
+function jsonOut(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/* ============================================================
+ *  LEITURA — monta o JSON no mesmo formato que o app já usa
+ * ============================================================ */
+
+function getData() {
+  const carRows = readRows(SHEETS.car);
+  const car = carRows[0] || { name: '', plate: '', model: '', currentKm: 0, currentKmDate: '' };
+
+  const categories = readRows(SHEETS.categories).map(c => ({
+    id: c.id,
+    name: c.name,
+    intervalKm: c.intervalKm === '' ? null : Number(c.intervalKm),
+    intervalMonths: c.intervalMonths === '' ? null : Number(c.intervalMonths)
+  }));
+
+  const itemsAll = readRows(SHEETS.items);
+  const records = readRows(SHEETS.records).map(r => {
+    const itemsForRec = itemsAll.filter(it => it.registroId === r.id);
+    return {
+      id: r.id,
+      date: fmtDateOut(r.date),
+      km: Number(r.km) || 0,
+      provider: r.provider || '',
+      osNumber: r.osNumber || '',
+      note: r.note || '',
+      categories: String(r.categorias || '').split(',').map(s => s.trim()).filter(Boolean),
+      parts: itemsForRec.filter(it => it.tipo === 'peca').map(mapItem),
+      services: itemsForRec.filter(it => it.tipo === 'servico').map(mapItem),
+      totalParts: Number(r.totalParts) || 0,
+      totalServices: Number(r.totalServices) || 0,
+      totalGeral: Number(r.totalGeral) || 0
+    };
+  });
+
+  const docs = readRows(SHEETS.docs).map(d => ({
+    id: d.id,
+    label: d.label,
+    dueDate: fmtDateOut(d.dueDate),
+    amount: d.amount === '' ? null : Number(d.amount),
+    paid: String(d.paid).toUpperCase() === 'TRUE',
+    note: d.note || ''
+  }));
+
+  const kmLog = readRows(SHEETS.kmLog).map(k => ({ date: fmtDateOut(k.date), km: Number(k.km) || 0 }));
+
+  return {
+    car: {
+      name: car.name || '',
+      plate: car.plate || '',
+      model: car.model || '',
+      currentKm: Number(car.currentKm) || 0,
+      currentKmDate: fmtDateOut(car.currentKmDate)
+    },
+    categories, records, docs, kmLog
+  };
+}
+
+function mapItem(it) {
+  return {
+    name: it.name || '',
+    qty: Number(it.qty) || 0,
+    unitPrice: Number(it.unitPrice) || 0,
+    discountPct: Number(it.discountPct) || 0,
+    total: Number(it.total) || 0
+  };
+}
+
+/* ============================================================
+ *  ESCRITA — regrava as abas a partir do estado completo
+ *  (estratégia simples: apaga e reescreve tudo a cada "Salvar")
+ * ============================================================ */
+
+function saveData(data) {
+  writeRows(SHEETS.car, ['name', 'plate', 'model', 'currentKm', 'currentKmDate'], [[
+    data.car.name, data.car.plate, data.car.model, data.car.currentKm, data.car.currentKmDate
+  ]]);
+
+  writeRows(SHEETS.categories, ['id', 'name', 'intervalKm', 'intervalMonths'],
+    (data.categories || []).map(c => [c.id, c.name, c.intervalKm ?? '', c.intervalMonths ?? '']));
+
+  const recRows = [];
+  const itemRows = [];
+  (data.records || []).forEach(r => {
+    recRows.push([
+      r.id, r.date, r.km, r.provider, r.osNumber, r.note,
+      (r.categories || []).join(','), r.totalParts, r.totalServices, r.totalGeral
+    ]);
+    (r.parts || []).forEach(p => itemRows.push([uid(), r.id, 'peca', p.name, p.qty, p.unitPrice, p.discountPct, p.total]));
+    (r.services || []).forEach(s => itemRows.push([uid(), r.id, 'servico', s.name, s.qty, s.unitPrice, s.discountPct, s.total]));
+  });
+  writeRows(SHEETS.records,
+    ['id', 'date', 'km', 'provider', 'osNumber', 'note', 'categorias', 'totalParts', 'totalServices', 'totalGeral'],
+    recRows);
+  writeRows(SHEETS.items,
+    ['id', 'registroId', 'tipo', 'name', 'qty', 'unitPrice', 'discountPct', 'total'],
+    itemRows);
+
+  writeRows(SHEETS.docs, ['id', 'label', 'dueDate', 'amount', 'paid', 'note'],
+    (data.docs || []).map(d => [d.id, d.label, d.dueDate || '', d.amount ?? '', !!d.paid, d.note || '']));
+
+  writeRows(SHEETS.kmLog, ['date', 'km'],
+    (data.kmLog || []).map(k => [k.date, k.km]));
+}
+
+function uid() {
+  return 'it_' + Utilities.getUuid().slice(0, 8);
+}
+
+/* ============================================================
+ *  UTILITÁRIOS DE PLANILHA
+ * ============================================================ */
+
+function sheet(name) {
+  const sh = SS.getSheetByName(name);
+  if (!sh) throw new Error('Aba não encontrada: ' + name + ' — rode setupSheets() primeiro.');
+  return sh;
+}
+
+function readRows(name) {
+  const sh = sheet(name);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const headers = values[0];
+  return values.slice(1)
+    .filter(row => row.some(cell => cell !== ''))
+    .map(row => {
+      const obj = {};
+      headers.forEach((h, i) => obj[h] = row[i]);
+      return obj;
+    });
+}
+
+function writeRows(name, headers, rows) {
+  const sh = sheet(name);
+  sh.clearContents();
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  }
+}
+
+function fmtDateOut(v) {
+  if (!v) return '';
+  if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone() || 'GMT', 'yyyy-MM-dd');
+  return String(v).slice(0, 10);
+}
+
+/* ============================================================
+ *  SETUP — rode esta função UMA VEZ manualmente pelo editor
+ *  (menu "Executar" > selecionar setupSheets > Executar)
+ *  Ela cria as abas e os cabeçalhos, se ainda não existirem.
+ * ============================================================ */
+
+function setupSheets() {
+  const defs = {
+    Carro: ['name', 'plate', 'model', 'currentKm', 'currentKmDate'],
+    Categorias: ['id', 'name', 'intervalKm', 'intervalMonths'],
+    Registros: ['id', 'date', 'km', 'provider', 'osNumber', 'note', 'categorias', 'totalParts', 'totalServices', 'totalGeral'],
+    Itens: ['id', 'registroId', 'tipo', 'name', 'qty', 'unitPrice', 'discountPct', 'total'],
+    Docs: ['id', 'label', 'dueDate', 'amount', 'paid', 'note'],
+    KmLog: ['date', 'km']
+  };
+  Object.keys(defs).forEach(name => {
+    let sh = SS.getSheetByName(name);
+    if (!sh) sh = SS.insertSheet(name);
+    if (sh.getLastRow() === 0) {
+      sh.getRange(1, 1, 1, defs[name].length).setValues([defs[name]]);
+    }
+  });
+  SpreadsheetApp.getUi().alert('Abas criadas/verificadas: ' + Object.keys(defs).join(', '));
+}
+
+/*
+ * ============================================================
+ *  COMO CONFIGURAR (passo a passo)
+ * ============================================================
+ *
+ * 1. Crie uma planilha nova no Google Sheets (pode ficar vazia).
+ * 2. Menu Extensões > Apps Script. Apague o conteúdo padrão e cole
+ *    este arquivo inteiro.
+ * 3. No editor, selecione a função "setupSheets" no seletor de função
+ *    (perto do botão Executar/Run) e clique em Executar. Na primeira
+ *    vez ele vai pedir autorização — aceite (é sua própria planilha).
+ *    Isso cria as abas: Carro, Categorias, Registros, Itens, Docs, KmLog.
+ * 4. Vá em Configurações do projeto (ícone de engrenagem) > Propriedades
+ *    do script > Adicionar propriedade do script:
+ *       nome:  APP_TOKEN
+ *       valor: escolha uma senha/token longo e aleatório, só seu
+ *    Isso evita que qualquer pessoa que descubra a URL leia ou
+ *    sobrescreva seus dados.
+ * 5. Menu Implantar > Nova implantação > tipo "App da Web".
+ *       Executar como: Eu (seu e-mail)
+ *       Quem pode acessar: Qualquer pessoa
+ *    Implante e copie a URL que termina em /exec — é a URL que o
+ *    painel do carro vai chamar.
+ * 6. Teste no navegador, colando:
+ *       SUA_URL/exec?token=SEU_TOKEN
+ *    Deve devolver um JSON com os dados vazios (categorias padrão
+ *    ainda não existem aqui — isso é preenchido pelo primeiro "Salvar"
+ *    feito pelo painel).
+ *
+ * Sempre que você mudar o código aqui, é preciso ir em Implantar >
+ * Gerenciar implantações > editar (ícone de lápis) > Nova versão,
+ * senão a URL antiga continua servindo o código anterior.
+ */
+`;
 
 function freshData(){
   return {
@@ -653,12 +952,27 @@ document.getElementById('btnCloudConfig').onclick = () => {
   document.getElementById('cloudToken').value = cfg.token;
   document.getElementById('overlayCloud').classList.add('open');
 };
+document.getElementById('btnOpenCloudFromBanner').onclick = () => document.getElementById('btnCloudConfig').click();
+document.getElementById('btnOpenGuide').onclick = () => document.getElementById('overlayGuide').classList.add('open');
+document.getElementById('btnCloseGuide').onclick = () => document.getElementById('overlayGuide').classList.remove('open');
+document.getElementById('btnDownloadScript').onclick = () => {
+  const blob = new Blob([APPS_SCRIPT_SOURCE], {type:'text/plain'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'apps-script-painel-carro.gs';
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+function updateOnboardingVisibility(){
+  document.getElementById('onboardingBanner').style.display = getCloudConfig() ? 'none' : 'block';
+}
 document.getElementById('btnCancelCloud').onclick = () => document.getElementById('overlayCloud').classList.remove('open');
 document.getElementById('btnRemoveCloud').onclick = () => {
   if(confirm('Remover a configuração de nuvem? O painel volta a salvar só localmente / em arquivo.')){
     clearCloudConfig();
     document.getElementById('overlayCloud').classList.remove('open');
     updateSaveStatus();
+    updateOnboardingVisibility();
   }
 };
 document.getElementById('btnSaveCloud').onclick = async () => {
@@ -666,6 +980,7 @@ document.getElementById('btnSaveCloud').onclick = async () => {
   const token = document.getElementById('cloudToken').value.trim();
   if(!url || !token){ alert('Preencha a URL e o token.'); return; }
   setCloudConfig({url, token});
+  updateOnboardingVisibility();
   document.getElementById('overlayCloud').classList.remove('open');
   await syncLoadCloud();
 };
@@ -747,6 +1062,7 @@ function switchTab(name){
 
 /* ===================== render ===================== */
 function renderAll(){
+  updateOnboardingVisibility();
   document.getElementById('carName').value = data.car.name || '';
   document.getElementById('carPlate').value = data.car.plate || '';
   document.getElementById('carModel').value = data.car.model || '';
